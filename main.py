@@ -9,35 +9,36 @@ from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
+# --- ENVIRONMENT CONFIGURATION ---
+# Set these in Render "Environment Variables" or a .env file
 DB_NAME = "sms_panel.db"
-ADMIN_KEY = "ADMIN_AMIT" 
-OTP_FEED_URL = "https://weak-deloris-nothing672434-fe85179d.koyeb.app/api/otps?limit=100"
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "ADMIN_AMIT")
+OTP_FEED_URL = os.environ.get("OTP_FEED_URL", "https://otplala-d0")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# ADMIN_IDS should be comma-separated: "12345,67890"
+ADMIN_IDS = os.environ.get("ADMIN_IDS", "").split(",")
 
-# Smart Cache for high-traffic stability
+# Smart Cache
 cache = {"data": None, "time": 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("TITAN_MULTI_LOADER")
+logger = logging.getLogger("TITAN_ETERNAL")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Numbers Table
         cursor.execute('''CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT UNIQUE, service TEXT, server TEXT DEFAULT '58', 
             status TEXT DEFAULT 'available')''')
-        # Orders Table
         cursor.execute('''CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT, phone TEXT, service TEXT, otp TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT (DATETIME('now')))''')
-        # Users Table
+            api_key TEXT, username TEXT, phone TEXT, service TEXT, server TEXT,
+            otp TEXT DEFAULT NULL, status TEXT DEFAULT 'pending', 
+            created_at DATETIME DEFAULT (DATETIME('now')))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE, 
-            username TEXT UNIQUE, 
+            api_key TEXT UNIQUE, username TEXT UNIQUE, 
             created_at DATETIME DEFAULT (DATETIME('now')))''')
         conn.commit()
 
@@ -46,15 +47,36 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+def send_admin_notification(order_data, otp):
+    """Sends a detailed success report to all Admin Telegram IDs."""
+    if not BOT_TOKEN or not ADMIN_IDS: return
+    
+    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    message = (
+        f"🔥 *OTP RECEIVED - TITAN LOG* 🔥\n\n"
+        f"👤 *User:* {order_data['username']}\n"
+        f"🔑 *API Key:* `{order_data['api_key']}`\n"
+        f"📱 *Number:* `{order_data['phone']}`\n"
+        f"🛠 *Service:* {order_data['service'].upper()}\n"
+        f"🌍 *Server:* {order_data['server']}\n"
+        f"📩 *OTP:* `{otp}`\n\n"
+        f"⏰ *Date/Time:* {now} UTC"
+    )
+    
+    for admin_id in ADMIN_IDS:
+        if not admin_id.strip(): continue
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            requests.post(url, json={"chat_id": admin_id, "text": message, "parse_mode": "Markdown"}, timeout=5)
+        except Exception as e:
+            logger.error(f"Telegram Error for {admin_id}: {e}")
+
 def auto_cleanup():
-    """Releases numbers after 60 mins of inactivity."""
+    """Sets pending orders to 'expired' - Numbers remain 'used'."""
     try:
         conn = get_db()
         limit_time = (datetime.now(timezone.utc) - timedelta(minutes=60)).strftime('%Y-%m-%d %H:%M:%S')
-        expired = conn.execute("SELECT phone, id FROM orders WHERE status = 'pending' AND created_at < ?", (limit_time,)).fetchall()
-        for order in expired:
-            conn.execute("UPDATE numbers SET status = 'available' WHERE phone = ?", (order['phone'],))
-            conn.execute("UPDATE orders SET status = 'canceled' WHERE id = ?", (order['id'],))
+        conn.execute("UPDATE orders SET status = 'expired' WHERE status = 'pending' AND created_at < ?", (limit_time,))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -68,12 +90,10 @@ def get_live_otps():
             resp = requests.get(OTP_FEED_URL, timeout=5)
             cache["data"] = resp.json().get("otps", [])
             cache["time"] = current_time
-        except Exception as e:
-            logger.error(f"External Feed Error: {e}")
-            return []
+        except: return []
     return cache["data"]
 
-# --- USER API (handler_api.php) ---
+# --- USER API ---
 
 @app.route('/stubs/handler_api.php', methods=['GET'])
 def handler():
@@ -96,8 +116,12 @@ def handler():
             conn.close()
             return "NO_NUMBERS"
         
-        conn.execute("UPDATE numbers SET status='busy' WHERE id=?", (num['id'],))
-        cursor = conn.execute("INSERT INTO orders (api_key, phone, service) VALUES (?, ?, ?)", (api_key, num['phone'], service))
+        # EXCLUSIVITY LOCK: Set status to 'used' immediately. NEVER available again.
+        conn.execute("UPDATE numbers SET status='used' WHERE id=?", (num['id'],))
+        cursor = conn.execute(
+            "INSERT INTO orders (api_key, username, phone, service, server) VALUES (?, ?, ?, ?, ?)", 
+            (api_key, user['username'], num['phone'], service, server)
+        )
         order_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -107,14 +131,13 @@ def handler():
         order_id = request.args.get('id')
         order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
         
-        if not order or order['status'] == 'canceled':
+        if not order or order['status'] in ['canceled', 'expired']:
             conn.close()
             return "NO_ACTIVATION"
         if order['status'] == 'successful':
             conn.close()
             return f"STATUS_OK:{order['otp']}"
         
-        # High-Precision Time Matching
         order_time = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
         live_data = get_live_otps()
         for entry in live_data:
@@ -122,26 +145,24 @@ def handler():
             otp_time = datetime.strptime(otp_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
 
             if entry['number'].strip() == order['phone'].strip() and otp_time > order_time:
-                conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
-                conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
+                otp_code = entry['otp']
+                conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (otp_code, order_id))
                 conn.commit()
+                # SEND BOT NOTIFICATION
+                send_admin_notification(order, otp_code)
                 conn.close()
-                return f"STATUS_OK:{entry['otp']}"
+                return f"STATUS_OK:{otp_code}"
         
         conn.close()
         return "STATUS_WAIT_CODE"
 
     elif action == "setStatus":
         order_id = request.args.get('id')
-        status = request.args.get('status')
-        if status == "8": 
-            order = conn.execute("SELECT phone FROM orders WHERE id=?", (order_id,)).fetchone()
-            if order:
-                conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
-                conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
-                conn.commit()
-                conn.close()
-                return "ACCESS_CANCEL"
+        if request.args.get('status') == "8": # Cancel
+            conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
+            conn.commit()
+            conn.close()
+            return "ACCESS_CANCEL"
         conn.close()
         return "BAD_ID"
 
@@ -150,78 +171,39 @@ def handler():
 
 # --- ADMIN ROUTES ---
 
-@app.route('/admin/generate_key', methods=['GET'])
-def gen_key():
-    if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
-    username = request.args.get('username', 'User').strip()
-    conn = get_db()
-    existing = conn.execute("SELECT api_key FROM users WHERE username = ?", (username,)).fetchone()
-    if existing:
-        api_key = existing['api_key']
-        conn.close()
-        return jsonify({"api_key": api_key, "status": "Already generated", "username": username})
-    new_key = secrets.token_hex(16)
-    try:
-        conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?)", (new_key, username))
-        conn.commit()
-        conn.close()
-        return jsonify({"api_key": new_key, "status": "Created", "username": username})
-    except:
-        conn.close()
-        return "DATABASE_ERROR", 500
-
 @app.route('/admin/set_key', methods=['GET'])
 def set_key():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
-    username = request.args.get('username')
-    new_api_key = request.args.get('api_key')
+    username, new_api_key = request.args.get('username'), request.args.get('api_key')
     conn = get_db()
     try:
         existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
         if existing:
             conn.execute("UPDATE users SET api_key = ? WHERE username = ?", (new_api_key, username))
-            status = "Updated"
         else:
             conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?)", (new_api_key, username))
-            status = "Created"
         conn.commit()
-        conn.close()
-        return jsonify({"username": username, "api_key": new_api_key, "status": status})
-    except:
-        conn.close()
-        return "ALREADY_IN_USE", 400
+        return jsonify({"status": "Success", "username": username, "api_key": new_api_key})
+    except: return "ERROR", 500
+    finally: conn.close()
 
 @app.route('/admin/add_bulk', methods=['POST'])
 def add_bulk():
-    """Adds multiple numbers for the same service/server at once."""
     if request.headers.get("Authorization") != ADMIN_KEY: return "Unauthorized", 401
     data = request.json
-    numbers = data.get('numbers', [])
-    service = data.get('service')
-    server = data.get('server', '58')
-    
     conn = get_db()
-    added, skipped = 0, 0
-    for phone in numbers:
-        try:
-            conn.execute("INSERT INTO numbers (phone, service, server) VALUES (?, ?, ?)", (phone.strip(), service, server))
-            added += 1
-        except:
-            skipped += 1
+    for phone in data.get('numbers', []):
+        try: conn.execute("INSERT INTO numbers (phone, service, server) VALUES (?, ?, ?)", (phone.strip(), data['service'], data.get('server', '58')))
+        except: continue
     conn.commit()
     conn.close()
-    return jsonify({"status": "Bulk Upload Complete", "added": added, "skipped": skipped})
+    return jsonify({"status": "Complete"})
 
 @app.route('/admin/master', methods=['GET'])
-def master_dashboard():
+def master():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
     conn = get_db()
     data = {
-        "stats": {
-            "total": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-            "success": conn.execute("SELECT COUNT(*) FROM orders WHERE status='successful'").fetchone()[0],
-            "canceled": conn.execute("SELECT COUNT(*) FROM orders WHERE status='canceled'").fetchone()[0]
-        },
         "keys": [dict(k) for k in conn.execute("SELECT * FROM users").fetchall()],
         "stock": [dict(s) for s in conn.execute("SELECT server, service, COUNT(*) as count FROM numbers WHERE status='available' GROUP BY server, service").fetchall()],
         "history": [dict(h) for h in conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 50").fetchall()]
