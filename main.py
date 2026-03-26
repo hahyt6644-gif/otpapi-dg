@@ -3,6 +3,7 @@ import requests
 import secrets
 import logging
 import time
+import os
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta, timezone
 
@@ -10,14 +11,14 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 DB_NAME = "sms_panel.db"
-ADMIN_KEY = "ADMIN_AMIT"
+ADMIN_KEY = "ADMIN_AMIT" 
 OTP_FEED_URL = "https://weak-deloris-nothing672434-fe85179d.koyeb.app/api/otps?limit=100"
 
-# Smart Cache variables
+# Smart Cache for high-traffic stability
 cache = {"data": None, "time": 0}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("TITAN_SERVER")
+logger = logging.getLogger("TITAN_MULTI_LOADER")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -32,10 +33,12 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_key TEXT, phone TEXT, service TEXT, otp TEXT DEFAULT NULL,
             status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT (DATETIME('now')))''')
-        # Users Table (No Balance)
+        # Users Table
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE, username TEXT, created_at DATETIME DEFAULT (DATETIME('now')))''')
+            api_key TEXT UNIQUE, 
+            username TEXT UNIQUE, 
+            created_at DATETIME DEFAULT (DATETIME('now')))''')
         conn.commit()
 
 def get_db():
@@ -58,7 +61,6 @@ def auto_cleanup():
         logger.error(f"Cleanup Error: {e}")
 
 def get_live_otps():
-    """Smart Cache: Only fetches from Koyeb once every 10 seconds."""
     global cache
     current_time = time.time()
     if cache["data"] is None or (current_time - cache["time"]) > 10:
@@ -66,13 +68,12 @@ def get_live_otps():
             resp = requests.get(OTP_FEED_URL, timeout=5)
             cache["data"] = resp.json().get("otps", [])
             cache["time"] = current_time
-            logger.info("External OTP Feed Refreshed.")
         except Exception as e:
-            logger.error(f"Feed Error: {e}")
+            logger.error(f"External Feed Error: {e}")
             return []
     return cache["data"]
 
-# --- THE USER API ---
+# --- USER API (handler_api.php) ---
 
 @app.route('/stubs/handler_api.php', methods=['GET'])
 def handler():
@@ -86,17 +87,10 @@ def handler():
         conn.close()
         return "BAD_KEY"
 
-    # ACTION: getNumber
     if action == "getNumber":
         service = request.args.get('service')
         server = request.args.get('server', '58')
-        
-        if not service: return "BAD_SERVICE"
-            
-        num = conn.execute(
-            "SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", 
-            (service, server)
-        ).fetchone()
+        num = conn.execute("SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", (service, server)).fetchone()
         
         if not num:
             conn.close()
@@ -109,24 +103,25 @@ def handler():
         conn.close()
         return f"ACCESS_NUMBER:{order_id}:{num['phone']}"
 
-    # ACTION: getStatus
     elif action == "getStatus":
         order_id = request.args.get('id')
         order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not order:
-            conn.close()
-            return "BAD_ID"
         
+        if not order or order['status'] == 'canceled':
+            conn.close()
+            return "NO_ACTIVATION"
         if order['status'] == 'successful':
             conn.close()
             return f"STATUS_OK:{order['otp']}"
-        if order['status'] == 'canceled':
-            conn.close()
-            return "NO_ACTIVATION"
-
+        
+        # High-Precision Time Matching
+        order_time = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
         live_data = get_live_otps()
         for entry in live_data:
-            if entry['number'].strip() == order['phone'].strip():
+            otp_time_str = entry['timestamp'].split('.')[0].replace('T', ' ')
+            otp_time = datetime.strptime(otp_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+
+            if entry['number'].strip() == order['phone'].strip() and otp_time > order_time:
                 conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
                 conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
                 conn.commit()
@@ -136,90 +131,105 @@ def handler():
         conn.close()
         return "STATUS_WAIT_CODE"
 
-    # ACTION: setStatus
     elif action == "setStatus":
         order_id = request.args.get('id')
         status = request.args.get('status')
-        order = conn.execute("SELECT phone, status FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not order:
-            conn.close()
-            return "BAD_ID"
-            
-        if status == "8": # Cancel
-            conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
-            conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
-            conn.commit()
-            conn.close()
-            return "ACCESS_CANCEL"
-            
+        if status == "8": 
+            order = conn.execute("SELECT phone FROM orders WHERE id=?", (order_id,)).fetchone()
+            if order:
+                conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
+                conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
+                conn.commit()
+                conn.close()
+                return "ACCESS_CANCEL"
         conn.close()
-        return "BAD_STATUS"
+        return "BAD_ID"
 
     conn.close()
     return "ERROR_SQL"
 
-# --- THE MASTER ADMIN DASHBOARD ---
-
-@app.route('/admin/master', methods=['GET'])
-def master_dashboard():
-    """Provides a full intelligence report of the server."""
-    if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
-    
-    conn = get_db()
-    
-    # 1. API Keys List
-    keys = conn.execute("SELECT username, api_key, created_at FROM users").fetchall()
-    
-    # 2. Stats
-    total_orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-    success_orders = conn.execute("SELECT COUNT(*) FROM orders WHERE status='successful'").fetchone()[0]
-    cancel_orders = conn.execute("SELECT COUNT(*) FROM orders WHERE status='canceled'").fetchone()[0]
-    
-    # 3. Stock List
-    stock = conn.execute("SELECT server, service, COUNT(*) as count FROM numbers WHERE status='available' GROUP BY server, service").fetchall()
-    
-    # 4. Recent History
-    history = conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 20").fetchall()
-    
-    conn.close()
-    
-    return jsonify({
-        "server_status": "Active",
-        "total_stats": {
-            "total": total_orders,
-            "success": success_orders,
-            "canceled": cancel_orders
-        },
-        "api_keys": [dict(k) for k in keys],
-        "available_stock": [dict(s) for s in stock],
-        "recent_20_orders": [dict(h) for h in history]
-    })
+# --- ADMIN ROUTES ---
 
 @app.route('/admin/generate_key', methods=['GET'])
 def gen_key():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
-    new_key = secrets.token_hex(16)
-    username = request.args.get('username', 'User')
+    username = request.args.get('username', 'User').strip()
     conn = get_db()
-    conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?)", (new_key, username))
-    conn.commit()
-    conn.close()
-    return f"CREATED_KEY:{new_key} FOR {username}"
+    existing = conn.execute("SELECT api_key FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        api_key = existing['api_key']
+        conn.close()
+        return jsonify({"api_key": api_key, "status": "Already generated", "username": username})
+    new_key = secrets.token_hex(16)
+    try:
+        conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?)", (new_key, username))
+        conn.commit()
+        conn.close()
+        return jsonify({"api_key": new_key, "status": "Created", "username": username})
+    except:
+        conn.close()
+        return "DATABASE_ERROR", 500
 
-@app.route('/admin/add', methods=['POST'])
-def admin_add():
-    if request.headers.get("Authorization") != ADMIN_KEY: return "Unauthorized", 401
-    data = request.json
+@app.route('/admin/set_key', methods=['GET'])
+def set_key():
+    if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
+    username = request.args.get('username')
+    new_api_key = request.args.get('api_key')
     conn = get_db()
     try:
-        conn.execute("INSERT INTO numbers (phone, service, server) VALUES (?, ?, ?)", 
-                     (data['phone'], data['service'], data.get('server', '58')))
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            conn.execute("UPDATE users SET api_key = ? WHERE username = ?", (new_api_key, username))
+            status = "Updated"
+        else:
+            conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?)", (new_api_key, username))
+            status = "Created"
         conn.commit()
-        return "SUCCESS"
-    except: return "EXISTS"
-    finally: conn.close()
+        conn.close()
+        return jsonify({"username": username, "api_key": new_api_key, "status": status})
+    except:
+        conn.close()
+        return "ALREADY_IN_USE", 400
+
+@app.route('/admin/add_bulk', methods=['POST'])
+def add_bulk():
+    """Adds multiple numbers for the same service/server at once."""
+    if request.headers.get("Authorization") != ADMIN_KEY: return "Unauthorized", 401
+    data = request.json
+    numbers = data.get('numbers', [])
+    service = data.get('service')
+    server = data.get('server', '58')
+    
+    conn = get_db()
+    added, skipped = 0, 0
+    for phone in numbers:
+        try:
+            conn.execute("INSERT INTO numbers (phone, service, server) VALUES (?, ?, ?)", (phone.strip(), service, server))
+            added += 1
+        except:
+            skipped += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"status": "Bulk Upload Complete", "added": added, "skipped": skipped})
+
+@app.route('/admin/master', methods=['GET'])
+def master_dashboard():
+    if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
+    conn = get_db()
+    data = {
+        "stats": {
+            "total": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+            "success": conn.execute("SELECT COUNT(*) FROM orders WHERE status='successful'").fetchone()[0],
+            "canceled": conn.execute("SELECT COUNT(*) FROM orders WHERE status='canceled'").fetchone()[0]
+        },
+        "keys": [dict(k) for k in conn.execute("SELECT * FROM users").fetchall()],
+        "stock": [dict(s) for s in conn.execute("SELECT server, service, COUNT(*) as count FROM numbers WHERE status='available' GROUP BY server, service").fetchall()],
+        "history": [dict(h) for h in conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 50").fetchall()]
+    }
+    conn.close()
+    return jsonify(data)
 
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=5050)
-      
+    port = int(os.environ.get("PORT", 5050))
+    app.run(host='0.0.0.0', port=port)
