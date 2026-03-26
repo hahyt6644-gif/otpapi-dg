@@ -1,6 +1,5 @@
 import sqlite3
 import requests
-import secrets
 import logging
 import time
 import os
@@ -12,15 +11,13 @@ app = Flask(__name__)
 # --- ENVIRONMENT CONFIG ---
 DB_NAME = "sms_panel.db"
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "ADMIN_AMIT")
-OTP_FEED_URL = os.environ.get("OTP_FEED_URL", "https://weak-delob")
+OTP_FEED_URL = os.environ.get("OTP_FEED_URL", "https://w00")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = os.environ.get("ADMIN_IDS", "").split(",")
 
-# Smart Cache for OTP feed
 cache = {"data": None, "time": 0}
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("TITAN_ABSOLUTE")
+logger = logging.getLogger("TITAN_STRICT_DOCS")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
@@ -36,8 +33,7 @@ def init_db():
             created_at DATETIME DEFAULT (DATETIME('now')))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE, username TEXT UNIQUE, 
-            created_at DATETIME DEFAULT (DATETIME('now')))''')
+            api_key TEXT UNIQUE, username TEXT UNIQUE)''')
         conn.commit()
 
 def get_db():
@@ -47,49 +43,52 @@ def get_db():
 
 def send_admin_notification(order_data, otp):
     if not BOT_TOKEN or not ADMIN_IDS: return
-    now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    message = (
-        f"✅ *OTP SUCCESS - TITAN REPORT* ✅\n\n"
-        f"👤 *User:* {order_data['username']}\n"
-        f"📱 *Number:* `{order_data['phone']}`\n"
-        f"📩 *OTP:* `{otp}`\n\n"
-        f"⏰ *Time:* {now} UTC"
-    )
+    now = datetime.now(timezone.utc).strftime('%H:%M:%S')
+    message = (f"✅ *OTP SUCCESS* ✅\n👤 *User:* {order_data['username']}\n"
+               f"📱 *Num:* `{order_data['phone']}`\n📩 *OTP:* `{otp}`\n⏰ *Time:* {now} UTC")
     for admin_id in ADMIN_IDS:
-        if not admin_id.strip(): continue
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            requests.post(url, json={"chat_id": admin_id, "text": message, "parse_mode": "Markdown"}, timeout=5)
-        except Exception as e: logger.error(f"Telegram Error: {e}")
+        if admin_id.strip():
+            try: requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": admin_id.strip(), "text": message, "parse_mode": "Markdown"}, timeout=5)
+            except: pass
 
 def get_live_otps():
     global cache
     current_time = time.time()
     if cache["data"] is None or (current_time - cache["time"]) > 5:
         try:
-            resp = requests.get(OTP_FEED_URL, timeout=5)
-            cache["data"] = resp.json().get("otps", [])
+            cache["data"] = requests.get(OTP_FEED_URL, timeout=5).json().get("otps", [])
             cache["time"] = current_time
         except: return []
     return cache["data"]
 
-# --- API ENDPOINTS ---
+# --- STRICT API HANDLER ---
 
 @app.route('/stubs/handler_api.php', methods=['GET'])
 def handler():
     api_key, action = request.args.get('api_key'), request.args.get('action')
     conn = get_db()
     
-    # 1. API Key Check
+    # Check Key
     user = conn.execute("SELECT * FROM users WHERE api_key = ?", (api_key,)).fetchone()
     if not user:
         conn.close()
         return "BAD_KEY"
 
-    # 2. GET NUMBER Logic
+    # ==========================================
+    # ACTION: getNumber
+    # ==========================================
     if action == "getNumber":
-        service, server = request.args.get('service'), request.args.get('server', '58')
+        service, server = request.args.get('service'), request.args.get('server')
+        
+        if not service:
+            conn.close()
+            return "BAD_SERVICE"
+        if not server:
+            conn.close()
+            return "BAD_SERVER"
+            
         num = conn.execute("SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", (service, server)).fetchone()
+        
         if not num:
             conn.close()
             return "NO_NUMBERS"
@@ -102,22 +101,30 @@ def handler():
         conn.close()
         return f"ACCESS_NUMBER:{order_id}:{num['phone']}"
 
-    # 3. GET STATUS (OTP) Logic
+    # ==========================================
+    # ACTION: getStatus
+    # ==========================================
     elif action == "getStatus":
         order_id = request.args.get('id')
+        if not order_id:
+            conn.close()
+            return "BAD_ID"
+            
         order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
         
         if not order:
             conn.close()
             return "BAD_ID"
+            
         if order['status'] == 'canceled':
             conn.close()
             return "NO_ACTIVATION"
+            
         if order['status'] == 'successful':
             conn.close()
             return f"STATUS_OK:{order['otp']}"
         
-        # Exact Time Matching
+        # OTP Matching
         order_time = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
         live_data = get_live_otps()
         
@@ -125,8 +132,7 @@ def handler():
             otp_time_str = entry['timestamp'].split('.')[0].replace('T', ' ')
             otp_time = datetime.strptime(otp_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
 
-            # Match Phone + Time + Sender
-            if entry['number'].strip() == order['phone'].strip() and otp_time > order_time:
+            if entry['number'].strip() == order['phone'].strip() and otp_time > (order_time + timedelta(seconds=3)):
                 if order['service'].lower() in entry['sender'].lower():
                     conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
                     conn.commit()
@@ -137,37 +143,57 @@ def handler():
         conn.close()
         return "STATUS_WAIT_CODE"
 
-    # 4. SET STATUS (Cancel) Logic
+    # ==========================================
+    # ACTION: setStatus
+    # ==========================================
     elif action == "setStatus":
         order_id, status_act = request.args.get('id'), request.args.get('status')
-        if status_act == "8":
-            order = conn.execute("SELECT created_at, status FROM orders WHERE id=?", (order_id,)).fetchone()
-            if not order:
-                conn.close()
-                return "BAD_ID"
+        
+        if not order_id:
+            conn.close()
+            return "BAD_ID"
+        if status_act not in ["8", "3"]:
+            conn.close()
+            return "BAD_STATUS"
             
+        order = conn.execute("SELECT created_at, status FROM orders WHERE id=?", (order_id,)).fetchone()
+        
+        if not order:
+            conn.close()
+            return "BAD_ID"
+            
+        if status_act == "8": # Cancel Request
             if order['status'] == 'canceled':
                 conn.close()
-                return "ACCESS_CANCEL" # Already done
-
-            # --- 1-MINUTE TIME LOCK ---
-            created_at = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            if (now - created_at).total_seconds() < 60:
+                return "STATUS_CANCEL"
+            if order['status'] == 'successful':
                 conn.close()
-                return "STATUS_WAIT_RETRY" 
+                return "NO_ACTIVATION"
+                
+            # 🛑 OFFICIAL 1-MINUTE HARD LOCK
+            created_at = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            seconds_passed = (datetime.now(timezone.utc) - created_at).total_seconds()
             
-            # Perform Cancel
+            if seconds_passed < 60:
+                conn.close()
+                # Bot spec says STATUS_WAIT_CODE is a valid setStatus response.
+                # This perfectly blocks the bot from crashing while denying the cancel.
+                return "STATUS_WAIT_CODE" 
+            
+            # Execute Cancel
             conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
             conn.commit()
             conn.close()
             return "ACCESS_CANCEL"
             
+        elif status_act == "3": # Next SMS Request (Dummy response to satisfy bot)
+            conn.close()
+            return "STATUS_WAIT_CODE"
+            
     conn.close()
     return "ERROR_SQL"
 
 # --- ADMIN ROUTES ---
-
 @app.route('/admin/set_key', methods=['GET'])
 def set_key():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
@@ -188,7 +214,7 @@ def add_bulk():
         except: continue
     conn.commit()
     conn.close()
-    return jsonify({"status": "Complete"})
+    return "SUCCESS"
 
 @app.route('/admin/master', methods=['GET'])
 def master():
