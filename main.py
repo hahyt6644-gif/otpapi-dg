@@ -1,6 +1,5 @@
 import sqlite3
 import requests
-import secrets
 import logging
 import time
 import os
@@ -22,7 +21,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        # Fixed: Added 'server' to numbers and 'username' to users/orders
         cursor.execute('''CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT UNIQUE, service TEXT, server TEXT DEFAULT '58', 
@@ -34,8 +32,7 @@ def init_db():
             created_at DATETIME DEFAULT (DATETIME('now')))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE, username TEXT UNIQUE, 
-            created_at DATETIME DEFAULT (DATETIME('now')))''')
+            api_key TEXT UNIQUE, username TEXT UNIQUE)''')
         conn.commit()
 
 def get_db():
@@ -68,88 +65,79 @@ def get_live_otps():
 
 @app.route('/stubs/handler_api.php', methods=['GET'])
 def handler():
-    api_key = request.args.get('api_key')
-    action = request.args.get('action')
-    conn = get_db()
-    
-    user = conn.execute("SELECT * FROM users WHERE api_key = ?", (api_key,)).fetchone()
-    if not user:
-        conn.close()
-        return "BAD_KEY"
-
-    if action == "getNumber":
-        service = request.args.get('service')
-        server = request.args.get('server', '58')
-        num = conn.execute("SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", (service, server)).fetchone()
+    try:
+        api_key = request.args.get('api_key')
+        action = request.args.get('action')
+        conn = get_db()
         
-        if not num:
+        user = conn.execute("SELECT * FROM users WHERE api_key = ?", (api_key,)).fetchone()
+        if not user:
             conn.close()
-            return "NO_NUMBERS"
-        
-        conn.execute("UPDATE numbers SET status='busy' WHERE id=?", (num['id'],))
-        # FIXED: Added username to the insert statement
-        cursor = conn.execute("INSERT INTO orders (api_key, username, phone, service) VALUES (?, ?, ?, ?)", 
-                              (api_key, user['username'], num['phone'], service))
-        order_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return f"ACCESS_NUMBER:{order_id}:{num['phone']}"
+            return "BAD_KEY"
 
-    elif action == "getStatus":
-        order_id = request.args.get('id')
-        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not order:
-            conn.close()
-            return "BAD_ID"
-        
-        if order['status'] == 'successful':
-            conn.close()
-            return f"STATUS_OK:{order['otp']}"
-        if order['status'] == 'canceled':
-            conn.close()
-            return "NO_ACTIVATION"
-
-        order_time = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-        live_data = get_live_otps()
-        for entry in live_data:
-            otp_time_str = entry['timestamp'].split('.')[0].replace('T', ' ')
-            otp_time = datetime.strptime(otp_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-            
-            if entry['number'].strip() == order['phone'].strip() and otp_time > (order_time + timedelta(seconds=3)):
-                if order['service'].lower() in entry['sender'].lower():
-                    conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
-                    conn.commit()
-                    send_admin_notification(order, entry['otp'])
-                    conn.close()
-                    return f"STATUS_OK:{entry['otp']}"
-        
-        conn.close()
-        return "STATUS_WAIT_CODE"
-
-    elif action == "setStatus":
-        order_id, status = request.args.get('id'), request.args.get('status')
-        order = conn.execute("SELECT created_at, phone, status FROM orders WHERE id=?", (order_id,)).fetchone()
-        if not order:
-            conn.close()
-            return "BAD_ID"
-            
-        if status == "8":
-            created_at = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - created_at).total_seconds() < 60:
+        if action == "getNumber":
+            service, server = request.args.get('service'), request.args.get('server', '58')
+            num = conn.execute("SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", (service, server)).fetchone()
+            if not num:
                 conn.close()
-                return "STATUS_WAIT_CODE" # Locks cancel for 1 min
+                return "NO_NUMBERS"
             
-            conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
-            conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
+            conn.execute("UPDATE numbers SET status='busy' WHERE id=?", (num['id'],))
+            cursor = conn.execute("INSERT INTO orders (api_key, username, phone, service) VALUES (?, ?, ?, ?)", 
+                                  (api_key, user['username'], num['phone'], service))
+            order_id = cursor.lastrowid
             conn.commit()
             conn.close()
-            return "ACCESS_CANCEL"
-            
-        conn.close()
-        return "BAD_STATUS"
+            return f"ACCESS_NUMBER:{order_id}:{num['phone']}"
 
-    conn.close()
-    return "ERROR_SQL"
+        elif action == "getStatus":
+            order_id = request.args.get('id')
+            order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not order:
+                conn.close()
+                return "BAD_ID"
+            if order['status'] == 'canceled':
+                conn.close()
+                return "NO_ACTIVATION"
+            if order['status'] == 'successful':
+                conn.close()
+                return f"STATUS_OK:{order['otp']}"
+
+            live_data = get_live_otps()
+            for entry in live_data:
+                # Direct check without time buffer for maximum speed
+                if entry['number'].strip() == order['phone'].strip():
+                    if order['service'].lower() in entry['sender'].lower():
+                        conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
+                        conn.commit()
+                        send_admin_notification(order, entry['otp'])
+                        conn.close()
+                        return f"STATUS_OK:{entry['otp']}"
+            conn.close()
+            return "STATUS_WAIT_CODE"
+
+        elif action == "setStatus":
+            order_id, status = request.args.get('id'), request.args.get('status')
+            order = conn.execute("SELECT phone, status FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not order:
+                conn.close()
+                return "BAD_ID"
+                
+            if status == "8": # Immediate Cancel
+                conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
+                conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
+                conn.commit()
+                conn.close()
+                return "ACCESS_CANCEL"
+                
+            conn.close()
+            return "BAD_STATUS"
+
+        conn.close()
+        return "ERROR_SQL"
+    except Exception as e:
+        # Prevents the "Internal Server Error" crash
+        return "ERROR_SQL"
 
 # --- ADMIN ROUTES ---
 
@@ -158,7 +146,6 @@ def set_key():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
     u, k = request.args.get('username'), request.args.get('api_key')
     conn = get_db()
-    # FIXED: Added UNIQUE constraint handling
     conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET api_key=excluded.api_key", (k, u))
     conn.commit()
     conn.close()
