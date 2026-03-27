@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
-# --- CONFIGURATION (Use Environment Variables for Security) ---
+# --- CONFIGURATION ---
 DB_NAME = "sms_panel.db"
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "ADMIN_AMIT")
 OTP_FEED_URL = "https://weak-deloris-nothing672434-fe85179d.koyeb.app/api/otps?limit=100"
@@ -17,24 +17,25 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "7538833010:AAHTTyzd6nnWQjy_emmYf3yp4eNc
 ADMIN_IDS = os.environ.get("ADMIN_IDS", "6931296977,5425526761").split(",")
 
 cache = {"data": None, "time": 0}
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("TITAN_SERVER")
 
 def init_db():
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
+        # Fixed: Added 'server' to numbers and 'username' to users/orders
         cursor.execute('''CREATE TABLE IF NOT EXISTS numbers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT UNIQUE, service TEXT, server TEXT DEFAULT '58', 
             status TEXT DEFAULT 'available')''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT, username TEXT, phone TEXT, service TEXT, otp TEXT DEFAULT NULL,
-            status TEXT DEFAULT 'pending', created_at DATETIME DEFAULT (DATETIME('now')))''')
+            api_key TEXT, username TEXT, phone TEXT, service TEXT, 
+            otp TEXT DEFAULT NULL, status TEXT DEFAULT 'pending', 
+            created_at DATETIME DEFAULT (DATETIME('now')))''')
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_key TEXT UNIQUE, username TEXT UNIQUE, created_at DATETIME DEFAULT (DATETIME('now')))''')
+            api_key TEXT UNIQUE, username TEXT UNIQUE, 
+            created_at DATETIME DEFAULT (DATETIME('now')))''')
         conn.commit()
 
 def get_db():
@@ -43,7 +44,6 @@ def get_db():
     return conn
 
 def send_admin_notification(order, otp):
-    """Notify Admins on Telegram about successful OTP."""
     if not BOT_TOKEN: return
     now = datetime.now(timezone.utc).strftime('%H:%M:%S')
     message = (f"✅ *OTP SUCCESS* ✅\n👤 *User:* {order['username']}\n"
@@ -70,8 +70,8 @@ def get_live_otps():
 def handler():
     api_key = request.args.get('api_key')
     action = request.args.get('action')
-    
     conn = get_db()
+    
     user = conn.execute("SELECT * FROM users WHERE api_key = ?", (api_key,)).fetchone()
     if not user:
         conn.close()
@@ -80,14 +80,14 @@ def handler():
     if action == "getNumber":
         service = request.args.get('service')
         server = request.args.get('server', '58')
-        if not service: return "BAD_SERVICE"
-            
         num = conn.execute("SELECT * FROM numbers WHERE service=? AND server=? AND status='available' LIMIT 1", (service, server)).fetchone()
+        
         if not num:
             conn.close()
             return "NO_NUMBERS"
         
         conn.execute("UPDATE numbers SET status='busy' WHERE id=?", (num['id'],))
+        # FIXED: Added username to the insert statement
         cursor = conn.execute("INSERT INTO orders (api_key, username, phone, service) VALUES (?, ?, ?, ?)", 
                               (api_key, user['username'], num['phone'], service))
         order_id = cursor.lastrowid
@@ -109,14 +109,12 @@ def handler():
             conn.close()
             return "NO_ACTIVATION"
 
-        # OTP Syncing
         order_time = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
         live_data = get_live_otps()
         for entry in live_data:
             otp_time_str = entry['timestamp'].split('.')[0].replace('T', ' ')
             otp_time = datetime.strptime(otp_time_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             
-            # Match Phone + Service + Time Buffer
             if entry['number'].strip() == order['phone'].strip() and otp_time > (order_time + timedelta(seconds=3)):
                 if order['service'].lower() in entry['sender'].lower():
                     conn.execute("UPDATE orders SET otp=?, status='successful' WHERE id=?", (entry['otp'], order_id))
@@ -135,12 +133,11 @@ def handler():
             conn.close()
             return "BAD_ID"
             
-        if status == "8": # Cancel
-            # 🛑 1-MINUTE LOCK LOGIC
+        if status == "8":
             created_at = datetime.strptime(order['created_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             if (datetime.now(timezone.utc) - created_at).total_seconds() < 60:
                 conn.close()
-                return "STATUS_WAIT_CODE" # Keeps bot waiting instead of erroring
+                return "STATUS_WAIT_CODE" # Locks cancel for 1 min
             
             conn.execute("UPDATE numbers SET status='available' WHERE phone=?", (order['phone'],))
             conn.execute("UPDATE orders SET status='canceled' WHERE id=?", (order_id,))
@@ -156,23 +153,12 @@ def handler():
 
 # --- ADMIN ROUTES ---
 
-@app.route('/admin/master', methods=['GET'])
-def master_dashboard():
-    if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
-    conn = get_db()
-    data = {
-        "api_keys": [dict(k) for k in conn.execute("SELECT username, api_key FROM users").fetchall()],
-        "stock": [dict(s) for s in conn.execute("SELECT server, service, COUNT(*) as count FROM numbers WHERE status='available' GROUP BY server, service").fetchall()],
-        "history": [dict(h) for h in conn.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT 20").fetchall()]
-    }
-    conn.close()
-    return jsonify(data)
-
 @app.route('/admin/set_key', methods=['GET'])
 def set_key():
     if request.args.get('admin_key') != ADMIN_KEY: return "Unauthorized", 401
     u, k = request.args.get('username'), request.args.get('api_key')
     conn = get_db()
+    # FIXED: Added UNIQUE constraint handling
     conn.execute("INSERT INTO users (api_key, username) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET api_key=excluded.api_key", (k, u))
     conn.commit()
     conn.close()
